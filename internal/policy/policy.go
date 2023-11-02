@@ -48,6 +48,8 @@ var (
 	ErrDanglingDelegationMetadata = errors.New("unreachable targets metadata found")
 	ErrNotRSLEntry                = errors.New("RSL entry expected, annotation found instead")
 	ErrDelegationNotFound         = errors.New("required delegation entry not found")
+	ErrUnknownObjectType          = errors.New("unknown object type passed to verify signature")
+	ErrVerifierConditionsUnmet    = errors.New("verifier's key and threshold constrains not met")
 )
 
 var ErrPolicyExists = errors.New("cannot initialize Policy namespace as it exists already")
@@ -342,6 +344,63 @@ func (s *State) FindPublicKeysForPath(ctx context.Context, path string) ([]*tuf.
 				key := allPublicKeys[keyID]
 				trustedKeys = append(trustedKeys, key)
 			}
+
+			if s.HasTargetsRole(delegation.Name) {
+				delegatedMetadata, err := s.GetTargetsMetadata(delegation.Name)
+				if err != nil {
+					return nil, err
+				}
+				for keyID, key := range delegatedMetadata.Delegations.Keys {
+					allPublicKeys[keyID] = key
+				}
+
+				if delegation.Terminating {
+					// Remove other delegations from the queue
+					delegationsQueue = delegatedMetadata.Delegations.Roles
+				} else {
+					// Depth first, so newly discovered delegations go first
+					// Also, we skip the allow-rule, so we don't include the
+					// last element in the delegatedMetadata list.
+					delegationsQueue = append(delegatedMetadata.Delegations.Roles[:len(delegatedMetadata.Delegations.Roles)-1], delegationsQueue...)
+				}
+			}
+		}
+	}
+}
+
+func (s *State) FindVerifiersForPath(ctx context.Context, path string) ([]*VerificationContext, error) {
+	if err := s.Verify(ctx); err != nil {
+		return nil, err
+	}
+
+	targetsMetadata, err := s.GetTargetsMetadata(TargetsRoleName)
+	if err != nil {
+		return nil, err
+	}
+
+	allPublicKeys := targetsMetadata.Delegations.Keys
+	delegationsQueue := targetsMetadata.Delegations.Roles
+
+	verifiers := []*VerificationContext{}
+	for {
+		if len(delegationsQueue) <= 1 {
+			return verifiers, nil
+		}
+
+		delegation := delegationsQueue[0]
+		delegationsQueue = delegationsQueue[1:]
+
+		if delegation.Matches(path) {
+			verifier := &VerificationContext{
+				name:      delegation.Name,
+				keys:      make([]*tuf.Key, 0, len(delegation.KeyIDs)),
+				threshold: delegation.Threshold,
+			}
+			for _, keyID := range delegation.KeyIDs {
+				key := allPublicKeys[keyID]
+				verifier.keys = append(verifier.keys, key)
+			}
+			verifiers = append(verifiers, verifier)
 
 			if s.HasTargetsRole(delegation.Name) {
 				delegatedMetadata, err := s.GetTargetsMetadata(delegation.Name)
@@ -694,4 +753,60 @@ func (s *State) findDelegationEntry(roleName string) (tuf.Delegation, error) {
 			delegationsQueue = append(delegationsQueue, delegationTargetsMetadata[delegation.Name].Delegations.Roles...)
 		}
 	}
+}
+
+type VerificationContext struct {
+	name      string
+	keys      []*tuf.Key
+	threshold int
+}
+
+func (v *VerificationContext) Name() string {
+	return v.name
+}
+
+func (v *VerificationContext) Keys() []*tuf.Key {
+	return v.keys
+}
+
+func (v *VerificationContext) Threshold() int {
+	return v.threshold
+}
+
+// TODO: this needs to be receiving more context to identify what attestations
+// to use
+func (v *VerificationContext) Verify(ctx context.Context, obj object.Object) error {
+	verifiedSignatures := 0
+	switch o := obj.(type) {
+	case *object.Commit:
+		for _, key := range v.keys {
+			// TODO: support attestations
+			err := gitinterface.VerifyCommitSignature(ctx, o, key)
+			if err == nil {
+				// Signature verification succeeded
+				verifiedSignatures++
+			} else if !errors.Is(err, gitinterface.ErrIncorrectVerificationKey) {
+				return err
+			}
+		}
+	case *object.Tag:
+		for _, key := range v.keys {
+			// TODO: support attestations
+			err := gitinterface.VerifyTagSignature(ctx, o, key)
+			if err == nil {
+				// Signature verification succeeded
+				verifiedSignatures++
+			} else if !errors.Is(err, gitinterface.ErrIncorrectVerificationKey) {
+				return err
+			}
+		}
+	default:
+		return ErrUnknownObjectType
+	}
+
+	if verifiedSignatures >= v.threshold {
+		return nil
+	}
+
+	return ErrVerifierConditionsUnmet
 }

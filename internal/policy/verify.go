@@ -15,7 +15,6 @@ import (
 	"github.com/gittuf/gittuf/internal/third_party/go-git"
 	"github.com/gittuf/gittuf/internal/third_party/go-git/plumbing"
 	"github.com/gittuf/gittuf/internal/third_party/go-git/plumbing/object"
-	"github.com/gittuf/gittuf/internal/tuf"
 
 	sslibdsse "github.com/secure-systems-lab/go-securesystemslib/dsse"
 )
@@ -344,20 +343,18 @@ func verifyEntry(ctx context.Context, repo *git.Repository, policy *State, entry
 	}
 
 	var (
-		trustedKeys           []*tuf.Key
-		err                   error
 		gitNamespaceVerified  = false
 		pathNamespaceVerified = true // Assume paths are verified until we find out otherwise
 	)
 
-	// 1. Find authorized public keys for entry's ref
-	trustedKeys, err = policy.FindPublicKeysForPath(ctx, fmt.Sprintf("git:%s", entry.RefName)) // FIXME: "git:" shouldn't be here
+	// 1. Find authorized verifiers for entry's ref
+	verifiers, err := policy.FindVerifiersForPath(ctx, fmt.Sprintf("git:%s", entry.RefName)) // FIXME: "git:" shouldn't be here
 	if err != nil {
 		return err
 	}
 
-	// No trusted keys => allow any key's signature for the git namespace
-	if len(trustedKeys) == 0 {
+	// No verifiers => no restrictions for the git namespace
+	if len(verifiers) == 0 {
 		gitNamespaceVerified = true
 	}
 
@@ -367,19 +364,18 @@ func verifyEntry(ctx context.Context, repo *git.Repository, policy *State, entry
 		return err
 	}
 
-	// 3. Use each trusted key to verify signature
-	for _, key := range trustedKeys {
-		err := gitinterface.VerifyCommitSignature(ctx, commitObj, key)
+	// 3. Use each verifier to verify signature
+	for _, verifier := range verifiers {
+		err := verifier.Verify(ctx, commitObj)
 		if err == nil {
 			// Signature verification succeeded
 			gitNamespaceVerified = true
 			break
-		}
-		if !errors.Is(err, gitinterface.ErrIncorrectVerificationKey) {
+		} else if !errors.Is(err, ErrVerifierConditionsUnmet) {
 			// Unexpected error
 			return err
 		}
-		// Haven't found a valid key, continue with next key
+		// Haven't found a valid verifier, continue with next
 	}
 
 	if !gitNamespaceVerified {
@@ -419,27 +415,30 @@ func verifyEntry(ctx context.Context, repo *git.Repository, policy *State, entry
 		}
 
 		pathsVerified := make([]bool, len(paths))
-		verifiedKeyID := "" // this will be set after one successful verification of the commit to avoid repeated signature verification
+		verifiedUsing := "" // this will be set after one successful verification of the commit to avoid repeated signature verification
 		for j, path := range paths {
-			trustedKeys, err := commitPolicy.FindPublicKeysForPath(ctx, fmt.Sprintf("file:%s", path)) // FIXME: "file:" shouldn't be here
+			verifiers, err := commitPolicy.FindVerifiersForPath(ctx, fmt.Sprintf("file:%s", path)) // FIXME: "file:" shouldn't be here
 			if err != nil {
 				return err
 			}
 
-			if len(trustedKeys) == 0 {
+			if len(verifiers) == 0 {
 				pathsVerified[j] = true
 				continue
 			}
 
-			if len(verifiedKeyID) > 0 {
-				// We've already verified and identified commit signature's key
-				// ID, we can just check if that key ID is trusted for the new
-				// path.
+			if len(verifiedUsing) > 0 {
+				// We've already verified and identified commit signature, we
+				// can just check if that verifier is trusted for the new path.
 				// If not found, we don't make any assumptions about it being a
-				// failure in case of key ID mismatches. So, the signature check
+				// failure in case of name mismatches. So, the signature check
 				// proceeds as usual.
-				for _, key := range trustedKeys {
-					if key.KeyID == verifiedKeyID {
+				//
+				// FIXME: this is probably a vuln as a rule name may re-occur
+				// without being met by a target delegation in different
+				// policies
+				for _, verifier := range verifiers {
+					if verifier.Name() == verifiedUsing {
 						pathsVerified[j] = true
 						break
 					}
@@ -450,19 +449,17 @@ func verifyEntry(ctx context.Context, repo *git.Repository, policy *State, entry
 				continue
 			}
 
-			for _, key := range trustedKeys {
-				err := gitinterface.VerifyCommitSignature(ctx, commit, key)
+			for _, verifier := range verifiers {
+				err := verifier.Verify(ctx, commit)
 				if err == nil {
 					// Signature verification succeeded
 					pathsVerified[j] = true
-					verifiedKeyID = key.KeyID
+					verifiedUsing = verifier.Name()
 					break
-				}
-				if !errors.Is(err, gitinterface.ErrIncorrectVerificationKey) {
+				} else if !errors.Is(err, ErrVerifierConditionsUnmet) {
 					// Unexpected error
 					return err
 				}
-				// Haven't found a valid key, continue with next key
 			}
 		}
 
