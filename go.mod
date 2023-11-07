@@ -26,6 +26,7 @@ require (
 	golang.org/x/crypto v0.14.0
 	golang.org/x/net v0.17.0
 	golang.org/x/sys v0.14.0
+	k8s.io/klog v1.0.0
 )
 
 require (

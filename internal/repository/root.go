@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	log "github.com/gittuf/gittuf/internal/logging"
 	"github.com/gittuf/gittuf/internal/policy"
 	"github.com/gittuf/gittuf/internal/signerverifier"
 	"github.com/gittuf/gittuf/internal/signerverifier/dsse"
@@ -21,6 +22,8 @@ func (r *Repository) InitializeRoot(ctx context.Context, rootKeyBytes []byte, si
 	if err := r.InitializeNamespaces(); err != nil {
 		return err
 	}
+
+	log.Print("Initializing root of trust")
 
 	publicKey, err := tuf.LoadKeyFromBytes(rootKeyBytes)
 	if err != nil {
